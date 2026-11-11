@@ -1,0 +1,10 @@
+node_modules/
+target/
+release/
+*.WebView2/
+*.exe
+*.pdb
+*.rgba
+*.zip
+.DS_Store
+Thumbs.db
