@@ -3,6 +3,24 @@ import type { Page } from '../sources/types';
 declare global {
   interface Window {
     __RUST_BACKEND__?: boolean;
+    api?: {
+      http(
+        url: string,
+        opts?: { method?: string; headers?: Record<string, string>; body?: string },
+      ): Promise<{ status: number; ok: boolean; text: string }>;
+      downloadChapter?(payload: {
+        manga_title: string;
+        chapter_title: string;
+        pages: { url: string; referer?: string }[];
+        upscale?: string;
+      }): Promise<DownloadResult>;
+      openFolder?(path?: string): Promise<void>;
+      translatePage?(
+        url: string,
+        referer: string | undefined,
+        targetLang: string,
+      ): Promise<TranslatedBubble[]>;
+    };
   }
 }
 
@@ -13,6 +31,7 @@ export interface ReqOpts {
 }
 
 const isRust = () => typeof window !== 'undefined' && Boolean(window.__RUST_BACKEND__);
+const hasElectron = () => typeof window !== 'undefined' && Boolean(window.api);
 
 export async function reqText(url: string, opts?: ReqOpts): Promise<string> {
   if (isRust()) {
@@ -26,14 +45,14 @@ export async function reqText(url: string, opts?: ReqOpts): Promise<string> {
     if (status < 200 || status >= 300) throw new Error(`HTTP ${status} — ${url}`);
     return text;
   }
-  const r = await fetch('/__proxy', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ url, opts }),
-  });
-  const status = Number(r.headers.get('x-upstream-status') || r.status);
+  if (window.api?.http) {
+    const res = await window.api.http(url, opts);
+    if (!res.ok) throw new Error(`HTTP ${res.status} — ${url}`);
+    return res.text;
+  }
+  const r = await fetch(url, opts);
   const text = await r.text();
-  if (status < 200 || status >= 300) throw new Error(`HTTP ${status} — ${url}`);
+  if (!r.ok) throw new Error(`HTTP ${r.status} — ${url}`);
   return text;
 }
 
@@ -53,7 +72,10 @@ export const proxied = (url?: string, referer?: string, upscale?: string) => {
   if (isRust()) {
     return `http://mimg.localhost/img?u=${encodeURIComponent(url)}${ref}${up}`;
   }
-  return `mimg://img/?u=${encodeURIComponent(url)}${ref}${up}`;
+  if (hasElectron()) {
+    return `mimg://img/?u=${encodeURIComponent(url)}${ref}${up}`;
+  }
+  return url;
 };
 
 export interface DownloadResult {
@@ -70,27 +92,38 @@ export async function downloadChapterToDisk(
   pages: Page[],
   upscale?: string,
 ): Promise<DownloadResult> {
-  const endpoint = isRust() ? 'http://mhttp.localhost/download-chapter' : '/__download';
-  const r = await fetch(endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      manga_title: mangaTitle,
-      chapter_title: chapterTitle,
-      pages: pages.map((p) => ({ url: p.url, referer: p.referer })),
-      upscale: upscale || 'off',
-    }),
-  });
-  return r.json();
+  const payload = {
+    manga_title: mangaTitle,
+    chapter_title: chapterTitle,
+    pages: pages.map((p) => ({ url: p.url, referer: p.referer })),
+    upscale: upscale || 'off',
+  };
+  if (isRust()) {
+    const r = await fetch('http://mhttp.localhost/download-chapter', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    return r.json();
+  }
+  if (window.api?.downloadChapter) {
+    return window.api.downloadChapter(payload);
+  }
+  return { ok: false, dir: '', cbz: '', count: 0, error: 'Not supported on this platform' };
 }
 
 export async function openDownloadsFolder(path = ''): Promise<void> {
-  const endpoint = isRust() ? 'http://mhttp.localhost/open-folder' : '/__open-folder';
-  await fetch(endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path }),
-  }).catch(() => {});
+  if (isRust()) {
+    await fetch('http://mhttp.localhost/open-folder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path }),
+    }).catch(() => {});
+    return;
+  }
+  if (window.api?.openFolder) {
+    await window.api.openFolder(path).catch(() => {});
+  }
 }
 
 export interface TranslatedBubble {
@@ -104,14 +137,25 @@ export interface TranslatedBubble {
 
 export async function translateTextApi(text: string, targetLang: string): Promise<string> {
   if (!text.trim()) return text;
-  const endpoint = isRust() ? 'http://mhttp.localhost/translate-text' : '/__translate-text';
-  const r = await fetch(endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text, target_lang: targetLang }),
-  });
-  const j = await r.json();
-  return j.translated || text;
+  if (isRust()) {
+    const r = await fetch('http://mhttp.localhost/translate-text', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, target_lang: targetLang }),
+    });
+    const j = await r.json();
+    return j.translated || text;
+  }
+  try {
+    const gUrl = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(targetLang)}&dt=t&q=${encodeURIComponent(text)}`;
+    const arr = await reqJson<any[]>(gUrl);
+    if (Array.isArray(arr?.[0])) {
+      return arr[0].map((seg: any) => seg?.[0] || '').join('') || text;
+    }
+  } catch {
+    // ignore
+  }
+  return text;
 }
 
 export async function translatePageApi(
@@ -120,12 +164,17 @@ export async function translatePageApi(
   targetLang: string,
 ): Promise<TranslatedBubble[]> {
   if (!url || !targetLang || targetLang === 'off') return [];
-  const endpoint = isRust() ? 'http://mhttp.localhost/translate-page' : '/__translate-page';
-  const r = await fetch(endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ url, referer, target_lang: targetLang }),
-  });
-  const j = await r.json();
-  return Array.isArray(j.bubbles) ? j.bubbles : [];
+  if (isRust()) {
+    const r = await fetch('http://mhttp.localhost/translate-page', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, referer, target_lang: targetLang }),
+    });
+    const j = await r.json();
+    return Array.isArray(j.bubbles) ? j.bubbles : [];
+  }
+  if (window.api?.translatePage) {
+    return window.api.translatePage(url, referer, targetLang);
+  }
+  return [];
 }
